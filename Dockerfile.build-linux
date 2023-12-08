@@ -1,0 +1,29 @@
+FROM ubuntu:20.04 as build-environment
+SHELL ["/bin/bash", "-c"]
+
+WORKDIR /opt
+
+RUN apt-get update -y && apt-get upgrade -y
+RUN apt-get install -y clang lld curl build-essential linux-headers-generic git gcc-aarch64-linux-gnu \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > rustup.sh \
+    && chmod +x ./rustup.sh \
+    && ./rustup.sh -y
+
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /opt/foundry
+COPY . .
+
+RUN --mount=type=cache,target=/root/.cargo/registry --mount=type=cache,target=/root/.cargo/git --mount=type=cache,target=/opt/foundry/target \
+    source $HOME/.profile && cargo build --release \
+    && mkdir out \
+    && mv target/release/forge out/forge \
+    && mv target/release/cast out/cast \
+    && mv target/release/anvil out/anvil \
+    && mv target/release/chisel out/chisel \
+    && strip out/forge \
+    && strip out/cast \
+    && strip out/chisel \
+    && strip out/anvil;
+
+RUN tar -czvf "foundry_linux.tar.gz" -C /opt/foundry/out forge cast anvil chisel
