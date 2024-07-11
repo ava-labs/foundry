@@ -1,18 +1,15 @@
 //! Various utilities to decode test results.
 
-use crate::constants::MAGIC_SKIP;
-use alloy_dyn_abi::{DynSolType, DynSolValue, JsonAbiExt};
-use alloy_json_abi::JsonAbi;
-use alloy_primitives::{B256, U256};
-use alloy_sol_types::{sol_data::String as SolString, SolType};
-use ethers::{abi::RawLog, contract::EthLogDecode, types::Log};
-use foundry_abi::console::ConsoleEvents::{self, *};
-use foundry_common::{fmt::format_token, SELECTOR_LEN};
-use foundry_utils::error::{ERROR_PREFIX, REVERT_PREFIX};
+use crate::abi::{Console, Vm};
+use alloy_dyn_abi::JsonAbiExt;
+use alloy_json_abi::{Error, JsonAbi};
+use alloy_primitives::{hex, Log, Selector};
+use alloy_sol_types::{SolCall, SolError, SolEventInterface, SolInterface, SolValue};
+use foundry_common::SELECTOR_LEN;
 use itertools::Itertools;
-use once_cell::sync::Lazy;
-use revm::interpreter::{return_ok, InstructionResult};
-use thiserror::Error;
+use revm::interpreter::InstructionResult;
+use rustc_hash::FxHashMap;
+use std::sync::OnceLock;
 
 /// Decode a set of logs, only returning logs from DSTest logging events and Hardhat's `console.log`
 pub fn decode_console_logs(logs: &[Log]) -> Vec<String> {
@@ -24,319 +21,193 @@ pub fn decode_console_logs(logs: &[Log]) -> Vec<String> {
 /// This function returns [None] if it is not a DSTest log or the result of a Hardhat
 /// `console.log`.
 pub fn decode_console_log(log: &Log) -> Option<String> {
-    // NOTE: We need to do this conversion because ethers-rs does not
-    // support passing `Log`s
-    let raw_log = RawLog { topics: log.topics.clone(), data: log.data.to_vec() };
-    let decoded = match ConsoleEvents::decode_log(&raw_log).ok()? {
-        LogsFilter(inner) => format!("{}", inner.0),
-        LogBytesFilter(inner) => format!("{}", inner.0),
-        LogNamedAddressFilter(inner) => format!("{}: {:?}", inner.key, inner.val),
-        LogNamedBytes32Filter(inner) => {
-            format!("{}: {}", inner.key, B256::new(inner.val))
-        }
-        LogNamedDecimalIntFilter(inner) => {
-            let (sign, val) = inner.val.into_sign_and_abs();
-            format!(
-                "{}: {}{}",
-                inner.key,
-                sign,
-                ethers::utils::format_units(val, inner.decimals.as_u32()).unwrap()
-            )
-        }
-        LogNamedDecimalUintFilter(inner) => {
-            format!(
-                "{}: {}",
-                inner.key,
-                ethers::utils::format_units(inner.val, inner.decimals.as_u32()).unwrap()
-            )
-        }
-        LogNamedIntFilter(inner) => format!("{}: {:?}", inner.key, inner.val),
-        LogNamedUintFilter(inner) => format!("{}: {:?}", inner.key, inner.val),
-        LogNamedBytesFilter(inner) => {
-            format!("{}: {}", inner.key, inner.val)
-        }
-        LogNamedStringFilter(inner) => format!("{}: {}", inner.key, inner.val),
-        LogNamedArray1Filter(inner) => format!("{}: {:?}", inner.key, inner.val),
-        LogNamedArray2Filter(inner) => format!("{}: {:?}", inner.key, inner.val),
-        LogNamedArray3Filter(inner) => format!("{}: {:?}", inner.key, inner.val),
-
-        e => e.to_string(),
-    };
-    Some(decoded)
+    Console::ConsoleEvents::decode_log(log, false).ok().map(|decoded| decoded.to_string())
 }
 
-/// Possible errors when decoding a revert error string.
-#[derive(Debug, Clone, Error)]
-pub enum RevertDecodingError {
-    #[error("Not enough data to decode")]
-    InsufficientErrorData,
-    #[error("Unsupported solidity builtin panic")]
-    UnsupportedSolidityBuiltinPanic,
-    #[error("Could not decode slice")]
-    SliceDecodingError,
-    #[error("Non-native error and not string")]
-    NonNativeErrorAndNotString,
-    #[error("Unknown Error Selector")]
-    UnknownErrorSelector,
-    #[error("Could not decode cheatcode string")]
-    UnknownCheatcodeErrorString,
-    #[error("Bad String decode")]
-    BadStringDecode,
-    #[error(transparent)]
-    AlloyDecodingError(alloy_dyn_abi::Error),
+/// Decodes revert data.
+#[derive(Clone, Debug, Default)]
+pub struct RevertDecoder {
+    /// The custom errors to use for decoding.
+    pub errors: FxHashMap<Selector, Vec<Error>>,
 }
 
-/// Given an ABI encoded error string with the function signature `Error(string)`, it decodes
-/// it and returns the revert error message.
-pub fn decode_revert(
-    err: &[u8],
-    maybe_abi: Option<&JsonAbi>,
-    status: Option<InstructionResult>,
-) -> Result<String, RevertDecodingError> {
-    if err.len() < SELECTOR_LEN {
-        if let Some(status) = status {
-            if !matches!(status, return_ok!()) {
-                return Ok(format!("EvmError: {status:?}"))
-            }
-        }
-        return Err(RevertDecodingError::InsufficientErrorData)
-    }
-
-    match <[u8; SELECTOR_LEN]>::try_from(&err[..SELECTOR_LEN]).unwrap() {
-        // keccak(Panic(uint256))
-        [78, 72, 123, 113] => {
-            // ref: https://soliditydeveloper.com/solidity-0.8
-            match err[err.len() - 1] {
-                1 => {
-                    // assert
-                    Ok("Assertion violated".to_string())
-                }
-                17 => {
-                    // safemath over/underflow
-                    Ok("Arithmetic over/underflow".to_string())
-                }
-                18 => {
-                    // divide by 0
-                    Ok("Division or modulo by 0".to_string())
-                }
-                33 => {
-                    // conversion into non-existent enum type
-                    Ok("Conversion into non-existent enum type".to_string())
-                }
-                34 => {
-                    // incorrectly encoded storage byte array
-                    Ok("Incorrectly encoded storage byte array".to_string())
-                }
-                49 => {
-                    // pop() on empty array
-                    Ok("`pop()` on empty array".to_string())
-                }
-                50 => {
-                    // index out of bounds
-                    Ok("Index out of bounds".to_string())
-                }
-                65 => {
-                    // allocating too much memory or creating too large array
-                    Ok("Memory allocation overflow".to_string())
-                }
-                81 => {
-                    // calling a zero initialized variable of internal function type
-                    Ok("Calling a zero initialized variable of internal function type".to_string())
-                }
-                _ => Err(RevertDecodingError::UnsupportedSolidityBuiltinPanic),
-            }
-        }
-        // keccak(Error(string)) | keccak(CheatcodeError(string))
-        REVERT_PREFIX | ERROR_PREFIX => {
-            DynSolType::abi_decode(&DynSolType::String, &err[SELECTOR_LEN..])
-                .map_err(RevertDecodingError::AlloyDecodingError)
-                .and_then(|v| {
-                    v.clone()
-                        .as_str()
-                        .map(|s| s.to_owned())
-                        .ok_or(RevertDecodingError::BadStringDecode)
-                })
-                .to_owned()
-        }
-        // keccak(expectRevert(bytes))
-        [242, 141, 206, 179] => {
-            let err_data = &err[SELECTOR_LEN..];
-            if err_data.len() > 64 {
-                let len = U256::try_from_be_slice(&err_data[32..64])
-                    .ok_or(RevertDecodingError::SliceDecodingError)?
-                    .to::<usize>();
-                if err_data.len() > 64 + len {
-                    let actual_err = &err_data[64..64 + len];
-                    if let Ok(decoded) = decode_revert(actual_err, maybe_abi, None) {
-                        // check if it's a builtin
-                        return Ok(decoded)
-                    } else if let Ok(as_str) = String::from_utf8(actual_err.to_vec()) {
-                        // check if it's a true string
-                        return Ok(as_str)
-                    }
-                }
-            }
-            Err(RevertDecodingError::NonNativeErrorAndNotString)
-        }
-        // keccak(expectRevert(bytes4))
-        [195, 30, 176, 224] => {
-            let err_data = &err[SELECTOR_LEN..];
-            if err_data.len() == 32 {
-                let actual_err = &err_data[..SELECTOR_LEN];
-                if let Ok(decoded) = decode_revert(actual_err, maybe_abi, None) {
-                    // it's a known selector
-                    return Ok(decoded)
-                }
-            }
-            Err(RevertDecodingError::UnknownErrorSelector)
-        }
-        _ => {
-            // See if the revert is caused by a skip() call.
-            if err == MAGIC_SKIP {
-                return Ok("SKIPPED".to_string())
-            }
-            // try to decode a custom error if provided an abi
-            if let Some(abi) = maybe_abi {
-                for abi_error in abi.errors() {
-                    if abi_error.selector() == err[..SELECTOR_LEN] {
-                        // if we don't decode, don't return an error, try to decode as a
-                        // string later
-                        if let Ok(decoded) = abi_error.abi_decode_input(&err[SELECTOR_LEN..], false)
-                        {
-                            let inputs = decoded
-                                .iter()
-                                .map(foundry_common::fmt::format_token)
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            return Ok(format!("{}({inputs})", abi_error.name))
-                        }
-                    }
-                }
-            }
-
-            // optimistically try to decode as string, unknown selector or `CheatcodeError`
-            let error = DynSolType::abi_decode(&DynSolType::String, err)
-                .map_err(|_| RevertDecodingError::BadStringDecode)
-                .and_then(|v| {
-                    v.as_str().map(|s| s.to_owned()).ok_or(RevertDecodingError::BadStringDecode)
-                })
-                .ok();
-
-            let error = error.filter(|err| err.as_str() != "");
-            error
-                .or_else(|| {
-                    // try decoding as unknown err
-                    SolString::abi_decode(&err[SELECTOR_LEN..], false)
-                        .map(|err_str| format!("{}:{err_str}", hex::encode(&err[..SELECTOR_LEN])))
-                        .ok()
-                })
-                .or_else(|| {
-                    // try to decode possible variations of custom error types
-                    decode_custom_error(err).map(|token| {
-                        let s = format!("Custom Error {}:", hex::encode(&err[..SELECTOR_LEN]));
-
-                        let err_str = format_token(&token);
-                        if err_str.starts_with('(') {
-                            format!("{s}{err_str}")
-                        } else {
-                            format!("{s}({err_str})")
-                        }
-                    })
-                })
-                .ok_or_else(|| RevertDecodingError::NonNativeErrorAndNotString)
-        }
+impl Default for &RevertDecoder {
+    fn default() -> Self {
+        static EMPTY: OnceLock<RevertDecoder> = OnceLock::new();
+        EMPTY.get_or_init(RevertDecoder::new)
     }
 }
 
-/// Tries to optimistically decode a custom solc error, with at most 4 arguments
-pub fn decode_custom_error(err: &[u8]) -> Option<DynSolValue> {
-    decode_custom_error_args(err, 4)
+impl RevertDecoder {
+    /// Creates a new, empty revert decoder.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the ABIs to use for error decoding.
+    ///
+    /// Note that this is decently expensive as it will hash all errors for faster indexing.
+    pub fn with_abis<'a>(mut self, abi: impl IntoIterator<Item = &'a JsonAbi>) -> Self {
+        self.extend_from_abis(abi);
+        self
+    }
+
+    /// Sets the ABI to use for error decoding.
+    ///
+    /// Note that this is decently expensive as it will hash all errors for faster indexing.
+    pub fn with_abi(mut self, abi: &JsonAbi) -> Self {
+        self.extend_from_abi(abi);
+        self
+    }
+
+    /// Sets the ABI to use for error decoding, if it is present.
+    ///
+    /// Note that this is decently expensive as it will hash all errors for faster indexing.
+    pub fn with_abi_opt(mut self, abi: Option<&JsonAbi>) -> Self {
+        if let Some(abi) = abi {
+            self.extend_from_abi(abi);
+        }
+        self
+    }
+
+    /// Extends the decoder with the given ABI's custom errors.
+    pub fn extend_from_abis<'a>(&mut self, abi: impl IntoIterator<Item = &'a JsonAbi>) {
+        for abi in abi {
+            self.extend_from_abi(abi);
+        }
+    }
+
+    /// Extends the decoder with the given ABI's custom errors.
+    pub fn extend_from_abi(&mut self, abi: &JsonAbi) {
+        for error in abi.errors() {
+            self.push_error(error.clone());
+        }
+    }
+
+    /// Adds a custom error to use for decoding.
+    pub fn push_error(&mut self, error: Error) {
+        self.errors.entry(error.selector()).or_default().push(error);
+    }
+
+    /// Tries to decode an error message from the given revert bytes.
+    ///
+    /// Note that this is just a best-effort guess, and should not be relied upon for anything other
+    /// than user output.
+    pub fn decode(&self, err: &[u8], status: Option<InstructionResult>) -> String {
+        self.maybe_decode(err, status).unwrap_or_else(|| {
+            if err.is_empty() {
+                "<empty revert data>".to_string()
+            } else {
+                trimmed_hex(err)
+            }
+        })
+    }
+
+    /// Tries to decode an error message from the given revert bytes.
+    ///
+    /// See [`decode`](Self::decode) for more information.
+    pub fn maybe_decode(&self, err: &[u8], status: Option<InstructionResult>) -> Option<String> {
+        if err.len() < SELECTOR_LEN {
+            if let Some(status) = status {
+                if !status.is_ok() {
+                    return Some(format!("EvmError: {status:?}"));
+                }
+            }
+            return if err.is_empty() {
+                None
+            } else {
+                Some(format!("custom error bytes {}", hex::encode_prefixed(err)))
+            };
+        }
+
+        if err == crate::constants::MAGIC_SKIP {
+            // Also used in forge fuzz runner
+            return Some("SKIPPED".to_string());
+        }
+
+        // Solidity's `Error(string)` or `Panic(uint256)`
+        if let Ok(e) = alloy_sol_types::GenericContractError::abi_decode(err, false) {
+            return Some(e.to_string());
+        }
+
+        let (selector, data) = err.split_at(SELECTOR_LEN);
+        let selector: &[u8; 4] = selector.try_into().unwrap();
+
+        match *selector {
+            // `CheatcodeError(string)`
+            Vm::CheatcodeError::SELECTOR => {
+                let e = Vm::CheatcodeError::abi_decode_raw(data, false).ok()?;
+                return Some(e.message);
+            }
+            // `expectRevert(bytes)`
+            Vm::expectRevert_2Call::SELECTOR => {
+                let e = Vm::expectRevert_2Call::abi_decode_raw(data, false).ok()?;
+                return self.maybe_decode(&e.revertData[..], status);
+            }
+            // `expectRevert(bytes4)`
+            Vm::expectRevert_1Call::SELECTOR => {
+                let e = Vm::expectRevert_1Call::abi_decode_raw(data, false).ok()?;
+                return self.maybe_decode(&e.revertData[..], status);
+            }
+            _ => {}
+        }
+
+        // Custom errors.
+        if let Some(errors) = self.errors.get(selector) {
+            for error in errors {
+                // If we don't decode, don't return an error, try to decode as a string later.
+                if let Ok(decoded) = error.abi_decode_input(data, false) {
+                    return Some(format!(
+                        "{}({})",
+                        error.name,
+                        decoded.iter().map(foundry_common::fmt::format_token).format(", ")
+                    ));
+                }
+            }
+        }
+
+        // ABI-encoded `string`.
+        if let Ok(s) = String::abi_decode(err, false) {
+            return Some(s);
+        }
+
+        // UTF-8-encoded string.
+        if let Ok(s) = std::str::from_utf8(err) {
+            return Some(s.to_string());
+        }
+
+        // Generic custom error.
+        Some(format!(
+            "custom error {}:{}",
+            hex::encode(selector),
+            std::str::from_utf8(data).map_or_else(|_| trimmed_hex(data), String::from)
+        ))
+    }
 }
 
-/// Tries to optimistically decode a custom solc error with a maximal amount of arguments
-///
-/// This will brute force decoding of custom errors with up to `args` arguments
-pub fn decode_custom_error_args(err: &[u8], args: usize) -> Option<DynSolValue> {
-    if err.len() <= SELECTOR_LEN {
-        return None
+fn trimmed_hex(s: &[u8]) -> String {
+    let n = 32;
+    if s.len() <= n {
+        hex::encode(s)
+    } else {
+        format!(
+            "{}…{} ({} bytes)",
+            &hex::encode(&s[..n / 2]),
+            &hex::encode(&s[s.len() - n / 2..]),
+            s.len()
+        )
     }
-
-    let err = &err[SELECTOR_LEN..];
-    /// types we check against
-    static TYPES: Lazy<Vec<DynSolType>> = Lazy::new(|| {
-        vec![
-            DynSolType::Address,
-            DynSolType::Bool,
-            DynSolType::Uint(256),
-            DynSolType::Int(256),
-            DynSolType::Bytes,
-            DynSolType::String,
-        ]
-    });
-
-    // check if single param, but only if it's a single word
-    if err.len() == 32 {
-        for ty in TYPES.iter() {
-            if let Ok(decoded) = ty.abi_decode(err) {
-                return Some(decoded)
-            }
-        }
-        return None
-    }
-
-    // brute force decode all possible combinations
-    for num in (2..=args).rev() {
-        for candidate in TYPES.iter().cloned().combinations(num) {
-            if let Ok(decoded) = DynSolType::abi_decode(&DynSolType::Tuple(candidate), err) {
-                return Some(decoded)
-            }
-        }
-    }
-
-    // try as array
-    for ty in TYPES.iter().cloned().map(|ty| DynSolType::Array(Box::new(ty))) {
-        if let Ok(decoded) = ty.abi_decode(err) {
-            return Some(decoded)
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, U256};
-    use alloy_sol_types::{sol, SolError};
-
     #[test]
-    fn test_decode_custom_error_address() {
-        sol! {
-            error AddressErr(address addr);
-        }
-        let err = AddressErr { addr: Address::random() };
-
-        let encoded = err.abi_encode();
-        let decoded = decode_custom_error(&encoded).unwrap();
-        assert_eq!(decoded, DynSolValue::Address(err.addr));
-    }
-
-    #[test]
-    fn test_decode_custom_error_args3() {
-        sol! {
-            error MyError(address addr, bool b, uint256 val);
-        }
-        let err = MyError { addr: Address::random(), b: true, val: U256::from(100u64) };
-
-        let encoded = err.clone().abi_encode();
-        let decoded = decode_custom_error(&encoded).unwrap();
+    fn test_trimmed_hex() {
+        assert_eq!(trimmed_hex(&hex::decode("1234567890").unwrap()), "1234567890");
         assert_eq!(
-            decoded,
-            DynSolValue::Tuple(vec![
-                DynSolValue::Address(err.addr),
-                DynSolValue::Bool(err.b),
-                DynSolValue::Uint(U256::from(100u64), 256),
-            ])
+            trimmed_hex(&hex::decode("492077697368207275737420737570706F72746564206869676865722D6B696E646564207479706573").unwrap()),
+            "49207769736820727573742073757070…6865722d6b696e646564207479706573 (41 bytes)"
         );
     }
 }

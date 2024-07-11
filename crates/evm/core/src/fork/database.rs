@@ -1,12 +1,12 @@
 //! A revm database that forks off a remote client
 
 use crate::{
-    backend::{DatabaseError, StateSnapshot},
-    fork::{BlockchainDb, SharedBackend},
+    backend::{RevertSnapshotAction, StateSnapshot},
     snapshot::Snapshots,
 };
 use alloy_primitives::{Address, B256, U256};
-use ethers::types::BlockId;
+use alloy_rpc_types::BlockId;
+use foundry_fork_db::{BlockchainDb, DatabaseError, SharedBackend};
 use parking_lot::Mutex;
 use revm::{
     db::{CacheDB, DatabaseRef},
@@ -21,7 +21,7 @@ use std::sync::Arc;
 /// endpoint. The inner in-memory database holds this storage and will be used for write operations.
 /// This database uses the `backend` for read and the `db` for write operations. But note the
 /// `backend` will also write (missing) data to the `db` in the background
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct ForkedDatabase {
     /// responsible for fetching missing data
     ///
@@ -110,10 +110,13 @@ impl ForkedDatabase {
         id
     }
 
-    pub fn revert_snapshot(&mut self, id: U256) -> bool {
+    /// Removes the snapshot from the tracked snapshot and sets it as the current state
+    pub fn revert_snapshot(&mut self, id: U256, action: RevertSnapshotAction) -> bool {
         let snapshot = { self.snapshots().lock().remove_at(id) };
         if let Some(snapshot) = snapshot {
-            self.snapshots().lock().insert_at(snapshot.clone(), id);
+            if action.is_keep() {
+                self.snapshots().lock().insert_at(snapshot.clone(), id);
+            }
             let ForkDbSnapshot {
                 local,
                 snapshot: StateSnapshot { accounts, storage, block_hashes },
@@ -172,20 +175,20 @@ impl Database for ForkedDatabase {
 impl DatabaseRef for ForkedDatabase {
     type Error = DatabaseError;
 
-    fn basic(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        self.cache_db.basic(address)
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        self.cache_db.basic_ref(address)
     }
 
-    fn code_by_hash(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        self.cache_db.code_by_hash(code_hash)
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.cache_db.code_by_hash_ref(code_hash)
     }
 
-    fn storage(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        DatabaseRef::storage(&self.cache_db, address, index)
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        DatabaseRef::storage_ref(&self.cache_db, address, index)
     }
 
-    fn block_hash(&self, number: U256) -> Result<B256, Self::Error> {
-        self.cache_db.block_hash(number)
+    fn block_hash_ref(&self, number: U256) -> Result<B256, Self::Error> {
+        self.cache_db.block_hash_ref(number)
     }
 }
 
@@ -204,8 +207,6 @@ pub struct ForkDbSnapshot {
     pub snapshot: StateSnapshot,
 }
 
-// === impl DbSnapshot ===
-
 impl ForkDbSnapshot {
     fn get_storage(&self, address: Address, index: U256) -> Option<U256> {
         self.local.accounts.get(&address).and_then(|account| account.storage.get(&index)).copied()
@@ -218,43 +219,43 @@ impl ForkDbSnapshot {
 impl DatabaseRef for ForkDbSnapshot {
     type Error = DatabaseError;
 
-    fn basic(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         match self.local.accounts.get(&address) {
             Some(account) => Ok(Some(account.info.clone())),
             None => {
                 let mut acc = self.snapshot.accounts.get(&address).cloned();
 
                 if acc.is_none() {
-                    acc = self.local.basic(address)?;
+                    acc = self.local.basic_ref(address)?;
                 }
                 Ok(acc)
             }
         }
     }
 
-    fn code_by_hash(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        self.local.code_by_hash(code_hash)
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        self.local.code_by_hash_ref(code_hash)
     }
 
-    fn storage(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
         match self.local.accounts.get(&address) {
             Some(account) => match account.storage.get(&index) {
                 Some(entry) => Ok(*entry),
                 None => match self.get_storage(address, index) {
-                    None => DatabaseRef::storage(&self.local, address, index),
+                    None => DatabaseRef::storage_ref(&self.local, address, index),
                     Some(storage) => Ok(storage),
                 },
             },
             None => match self.get_storage(address, index) {
-                None => DatabaseRef::storage(&self.local, address, index),
+                None => DatabaseRef::storage_ref(&self.local, address, index),
                 Some(storage) => Ok(storage),
             },
         }
     }
 
-    fn block_hash(&self, number: U256) -> Result<B256, Self::Error> {
+    fn block_hash_ref(&self, number: U256) -> Result<B256, Self::Error> {
         match self.snapshot.block_hashes.get(&number).copied() {
-            None => self.local.block_hash(number),
+            None => self.local.block_hash_ref(number),
             Some(block_hash) => Ok(block_hash),
         }
     }
@@ -263,15 +264,15 @@ impl DatabaseRef for ForkDbSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fork::BlockchainDbMeta;
-    use foundry_common::get_http_provider;
+    use crate::backend::BlockchainDbMeta;
+    use foundry_common::provider::get_http_provider;
     use std::collections::BTreeSet;
 
     /// Demonstrates that `Database::basic` for `ForkedDatabase` will always return the
     /// `AccountInfo`
     #[tokio::test(flavor = "multi_thread")]
     async fn fork_db_insert_basic_default() {
-        let rpc = foundry_utils::rpc::next_http_rpc_endpoint();
+        let rpc = foundry_test_utils::rpc::next_http_rpc_endpoint();
         let provider = get_http_provider(rpc.clone());
         let meta = BlockchainDbMeta {
             cfg_env: Default::default(),

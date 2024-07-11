@@ -1,14 +1,8 @@
 //! Genesis settings
 
-use crate::{
-    eth::backend::db::{Db, MaybeHashDatabase},
-    genesis::Genesis,
-};
-use alloy_primitives::{Address as aAddress, B256, U256};
-use ethers::{
-    abi::ethereum_types::BigEndianHash,
-    types::{Address, H256},
-};
+use crate::eth::backend::db::{Db, MaybeFullDatabase};
+use alloy_genesis::{Genesis, GenesisAccount};
+use alloy_primitives::{Address, B256, U256};
 use foundry_evm::{
     backend::{DatabaseError, DatabaseResult, StateSnapshot},
     revm::{
@@ -16,13 +10,12 @@ use foundry_evm::{
         primitives::{AccountInfo, Bytecode, KECCAK_EMPTY},
     },
 };
-use foundry_utils::types::{ToAlloy, ToEthers};
 use parking_lot::Mutex;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLockWriteGuard;
 
 /// Genesis settings
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct GenesisConfig {
     /// The initial timestamp for the genesis block
     pub timestamp: u64,
@@ -38,8 +31,6 @@ pub struct GenesisConfig {
     /// The `genesis.json` if provided
     pub genesis_init: Option<Genesis>,
 }
-
-// === impl GenesisConfig ===
 
 impl GenesisConfig {
     /// Returns fresh `AccountInfo`s for the configured `accounts`
@@ -62,24 +53,36 @@ impl GenesisConfig {
         mut db: RwLockWriteGuard<'_, Box<dyn Db>>,
     ) -> DatabaseResult<()> {
         if let Some(ref genesis) = self.genesis_init {
-            for (addr, mut acc) in genesis.alloc.accounts.clone() {
+            for (addr, mut acc) in genesis.alloc.clone() {
                 let storage = std::mem::take(&mut acc.storage);
                 // insert all accounts
-                db.insert_account(addr, acc.into());
+                db.insert_account(addr, self.genesis_to_account_info(&acc));
                 // insert all storage values
-                for (k, v) in storage.iter() {
-                    db.set_storage_at(addr, k.into_uint(), v.into_uint())?;
+                for (k, v) in storage.unwrap_or_default().iter() {
+                    db.set_storage_at(addr, U256::from_be_bytes(k.0), U256::from_be_bytes(v.0))?;
                 }
             }
         }
         Ok(())
     }
 
+    /// Converts a [`GenesisAccount`] to an [`AccountInfo`]
+    fn genesis_to_account_info(&self, acc: &GenesisAccount) -> AccountInfo {
+        let GenesisAccount { code, balance, nonce, .. } = acc.clone();
+        let code = code.map(Bytecode::new_raw);
+        AccountInfo {
+            balance,
+            nonce: nonce.unwrap_or_default(),
+            code_hash: code.as_ref().map(|code| code.hash_slow()).unwrap_or(KECCAK_EMPTY),
+            code,
+        }
+    }
+
     /// Returns a database wrapper that points to the genesis and is aware of all provided
     /// [AccountInfo]
     pub(crate) fn state_db_at_genesis<'a>(
         &self,
-        db: Box<dyn MaybeHashDatabase + 'a>,
+        db: Box<dyn MaybeFullDatabase + 'a>,
     ) -> AtGenesisStateDb<'a> {
         AtGenesisStateDb {
             genesis: self.genesis_init.clone(),
@@ -98,47 +101,42 @@ impl GenesisConfig {
 pub(crate) struct AtGenesisStateDb<'a> {
     genesis: Option<Genesis>,
     accounts: HashMap<Address, AccountInfo>,
-    db: Box<dyn MaybeHashDatabase + 'a>,
+    db: Box<dyn MaybeFullDatabase + 'a>,
 }
 
 impl<'a> DatabaseRef for AtGenesisStateDb<'a> {
     type Error = DatabaseError;
-    fn basic(&self, address: aAddress) -> DatabaseResult<Option<AccountInfo>> {
-        if let Some(acc) = self.accounts.get(&(address.to_ethers())).cloned() {
+    fn basic_ref(&self, address: Address) -> DatabaseResult<Option<AccountInfo>> {
+        if let Some(acc) = self.accounts.get(&(address)).cloned() {
             return Ok(Some(acc))
         }
-        self.db.basic(address)
+        self.db.basic_ref(address)
     }
 
-    fn code_by_hash(&self, code_hash: B256) -> DatabaseResult<Bytecode> {
+    fn code_by_hash_ref(&self, code_hash: B256) -> DatabaseResult<Bytecode> {
         if let Some((_, acc)) = self.accounts.iter().find(|(_, acc)| acc.code_hash == code_hash) {
             return Ok(acc.code.clone().unwrap_or_default())
         }
-        self.db.code_by_hash(code_hash)
+        self.db.code_by_hash_ref(code_hash)
     }
 
-    fn storage(&self, address: aAddress, index: U256) -> DatabaseResult<U256> {
-        if let Some(acc) = self
-            .genesis
-            .as_ref()
-            .and_then(|genesis| genesis.alloc.accounts.get(&(address.to_ethers())))
-        {
-            let value = acc
-                .storage
-                .get(&H256::from_uint(&(index.to_ethers())))
-                .copied()
-                .unwrap_or_default();
-            return Ok(value.into_uint().to_alloy())
+    fn storage_ref(&self, address: Address, index: U256) -> DatabaseResult<U256> {
+        if let Some(acc) = self.genesis.as_ref().and_then(|genesis| genesis.alloc.get(&(address))) {
+            if let Some(storage) = acc.storage.as_ref() {
+                return Ok(U256::from_be_bytes(
+                    storage.get(&B256::from(index)).copied().unwrap_or_default().0,
+                ))
+            }
         }
-        self.db.storage(address, index)
+        self.db.storage_ref(address, index)
     }
 
-    fn block_hash(&self, number: U256) -> DatabaseResult<B256> {
-        self.db.block_hash(number)
+    fn block_hash_ref(&self, number: U256) -> DatabaseResult<B256> {
+        self.db.block_hash_ref(number)
     }
 }
 
-impl<'a> MaybeHashDatabase for AtGenesisStateDb<'a> {
+impl<'a> MaybeFullDatabase for AtGenesisStateDb<'a> {
     fn clear_into_snapshot(&mut self) -> StateSnapshot {
         self.db.clear_into_snapshot()
     }

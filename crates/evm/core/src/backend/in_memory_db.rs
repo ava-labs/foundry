@@ -1,20 +1,22 @@
-//! The in memory DB
-use crate::{backend::error::DatabaseError, snapshot::Snapshots};
+//! In-memory database.
+
+use crate::snapshot::Snapshots;
 use alloy_primitives::{Address, B256, U256};
+use foundry_fork_db::DatabaseError;
 use revm::{
     db::{CacheDB, DatabaseRef, EmptyDB},
     primitives::{Account, AccountInfo, Bytecode, HashMap as Map},
     Database, DatabaseCommit,
 };
 
-/// Type alias for an in memory database
+/// Type alias for an in-memory database.
 ///
-/// See `EmptyDBWrapper`
+/// See [`EmptyDBWrapper`].
 pub type FoundryEvmInMemoryDB = CacheDB<EmptyDBWrapper>;
 
-/// In memory Database for anvil
+/// In-memory [`Database`] for Anvil.
 ///
-/// This acts like a wrapper type for [InMemoryDB] but is capable of applying snapshots
+/// This acts like a wrapper type for [`FoundryEvmInMemoryDB`] but is capable of applying snapshots.
 #[derive(Debug)]
 pub struct MemDb {
     pub inner: FoundryEvmInMemoryDB,
@@ -29,20 +31,21 @@ impl Default for MemDb {
 
 impl DatabaseRef for MemDb {
     type Error = DatabaseError;
-    fn basic(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
-        DatabaseRef::basic(&self.inner, address)
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        DatabaseRef::basic_ref(&self.inner, address)
     }
 
-    fn code_by_hash(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        DatabaseRef::code_by_hash(&self.inner, code_hash)
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        DatabaseRef::code_by_hash_ref(&self.inner, code_hash)
     }
 
-    fn storage(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        DatabaseRef::storage(&self.inner, address, index)
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        DatabaseRef::storage_ref(&self.inner, address, index)
     }
 
-    fn block_hash(&self, number: U256) -> Result<B256, Self::Error> {
-        DatabaseRef::block_hash(&self.inner, number)
+    fn block_hash_ref(&self, number: U256) -> Result<B256, Self::Error> {
+        DatabaseRef::block_hash_ref(&self.inner, number)
     }
 }
 
@@ -80,41 +83,43 @@ impl DatabaseCommit for MemDb {
 ///
 /// This will also _always_ return `Some(AccountInfo)`:
 ///
-/// The [`Database`](revm::Database) implementation for `CacheDB` manages an `AccountState` for the
+/// The [`Database`] implementation for `CacheDB` manages an `AccountState` for the
 /// `DbAccount`, this will be set to `AccountState::NotExisting` if the account does not exist yet.
 /// This is because there's a distinction between "non-existing" and "empty",
 /// see <https://github.com/bluealloy/revm/blob/8f4348dc93022cffb3730d9db5d3ab1aad77676a/crates/revm/src/db/in_memory_db.rs#L81-L83>.
-/// If an account is `NotExisting`, `Database(Ref)::basic` will always return `None` for the
-/// requested `AccountInfo`. To prevent this, we ensure that a missing account is never marked as
-/// `NotExisting` by always returning `Some` with this type.
-#[derive(Debug, Default, Clone)]
+/// If an account is `NotExisting`, `Database::basic_ref` will always return `None` for the
+/// requested `AccountInfo`.
+///
+/// To prevent this, we ensure that a missing account is never marked as `NotExisting` by always
+/// returning `Some` with this type, which will then insert a default [`AccountInfo`] instead
+/// of one marked as `AccountState::NotExisting`.
+#[derive(Clone, Debug, Default)]
 pub struct EmptyDBWrapper(EmptyDB);
 
 impl DatabaseRef for EmptyDBWrapper {
     type Error = DatabaseError;
 
-    fn basic(&self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+    fn basic_ref(&self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
         // Note: this will always return `Some(AccountInfo)`, for the reason explained above
         Ok(Some(AccountInfo::default()))
     }
 
-    fn code_by_hash(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
-        Ok(self.0.code_by_hash(code_hash)?)
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        Ok(self.0.code_by_hash_ref(code_hash)?)
     }
-    fn storage(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        Ok(self.0.storage(address, index)?)
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        Ok(self.0.storage_ref(address, index)?)
     }
 
-    fn block_hash(&self, number: U256) -> Result<B256, Self::Error> {
-        Ok(self.0.block_hash(number)?)
+    fn block_hash_ref(&self, number: U256) -> Result<B256, Self::Error> {
+        Ok(self.0.block_hash_ref(number)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use alloy_primitives::b256;
-
     use super::*;
+    use alloy_primitives::b256;
 
     /// Ensures the `Database(Ref)` implementation for `revm::CacheDB` works as expected
     ///
@@ -144,7 +149,8 @@ mod tests {
         let mut db = CacheDB::new(EmptyDB::default());
         let address = Address::random();
 
-        let info = DatabaseRef::basic(&db, address).unwrap();
+        // We use `basic_ref` here to ensure that the account is not marked as `NotExisting`.
+        let info = DatabaseRef::basic_ref(&db, address).unwrap();
         assert!(info.is_none());
         let mut info = info.unwrap_or_default();
         info.balance = U256::from(500u64);
@@ -166,6 +172,8 @@ mod tests {
         ));
 
         let info = Database::basic(&mut db, address).unwrap();
+        // We know info exists, as MemDb always returns `Some(AccountInfo)` due to the
+        // `EmptyDbWrapper`.
         assert!(info.is_some());
         let mut info = info.unwrap();
         info.balance = U256::from(500u64);
